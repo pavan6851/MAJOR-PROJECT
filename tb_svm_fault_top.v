@@ -1,12 +1,18 @@
 // =============================================================================
-//  tb_svm_fault_top.v  - Self-checking testbench
+//  tb_svm_fault_top.v  - Self-checking testbench  (FIXED timing)
 //  PMDC Motor Fault Detection - SVM Inference Core
 //
 //  Reads tb_vectors.txt:  15 Q8.24 integers + expected_class per line
-//  Expected result: 87.08% accuracy (209/240 correct)
+//  Expected result: ~87.08% accuracy (209/240 correct)
 //
-//  Results printed to TCL console via $display.
-//  Compatible: Verilog-2001 and SystemVerilog
+//  Pipeline latency breakdown:
+//    svm_dot_product: 4 registered stages (l0 → l1 → l2 → out)
+//    svm_fault_top voting register: 1 more stage
+//    Total: 5 clock cycles from feat_valid rising edge to result_valid
+//
+//  FIX: After asserting feat_valid for 1 cycle, we wait PIPE_CYCLES clocks,
+//       then sample result_valid on the NEXT posedge (not immediately after).
+//       This corrects the off-by-one that caused result_valid to always be 0.
 // =============================================================================
 `timescale 1ns/1ps
 
@@ -16,7 +22,9 @@ module tb_svm_fault_top;
     // Parameters
     // -------------------------------------------------------------------------
     parameter CLK_PERIOD  = 10;   // 10 ns = 100 MHz
-    parameter PIPE_CYCLES = 6;    
+    // Total pipeline depth:
+    //   4 stages in dot-product  +  1 stage for voting register = 5
+    parameter PIPE_CYCLES = 5;
 
     // -------------------------------------------------------------------------
     // DUT signals
@@ -105,14 +113,13 @@ module tb_svm_fault_top;
         // Reset sequence
         repeat (4) @(posedge clk);
         rst_n = 1;
-        @(posedge clk);
+        // Flush pipeline - wait 10 idle cycles after reset
+        repeat (10) @(posedge clk);
 
         // ── Open test vector file ─────────────────────────────────────────
         fd = $fopen("tb_vectors.txt", "r");
         if (fd == 0) begin
-            $display("ERROR: tb_vectors.txt not found in xsim working directory.");
-            $display("Path: F:/XILINX/ML Inference/SVM/SVM.sim/sim_1/behav/xsim/");
-            $display("Copy tb_vectors.txt into that folder and re-run.");
+            $display("ERROR: tb_vectors.txt not found.");
             $finish;
         end
 
@@ -129,24 +136,32 @@ module tb_svm_fault_top;
                 fv[5],  fv[6],  fv[7],  fv[8],  fv[9],
                 fv[10], fv[11], fv[12], fv[13], fv[14],
                 expected_class);
-                
+
             if (r != 16) begin
                 if (!$feof(fd))
                     $display("WARNING: Malformed line (%0d fields), skipping", r);
             end else begin
-        
-                // Drive inputs for one clock cycle
+
+                // ── Step 1: Drive inputs, assert feat_valid for exactly 1 cycle
                 drive_features(fv[0],fv[1],fv[2],fv[3],fv[4],fv[5],fv[6],
                                fv[7],fv[8],fv[9],fv[10],fv[11],fv[12],fv[13],fv[14]);
-        
                 feat_valid = 1'b1;
-                @(posedge clk);
+                @(posedge clk);       // cycle 1: data captured, valid propagates
+                #1;                   // tiny delta to de-glitch read-after-drive
                 feat_valid = 1'b0;
-        
-                // Wait for pipeline output
-                repeat (PIPE_CYCLES) @(posedge clk);
-        
-                // Per-class total tracking
+
+                // ── Step 2: Wait exactly PIPE_CYCLES-1 more rising edges.
+                //    After the feat_valid posedge:
+                //      +1 clk → l0 computed, valid_l0 asserted
+                //      +2 clk → l1 computed, valid_l1 asserted
+                //      +3 clk → l2 computed, valid_l2 asserted
+                //      +4 clk → score+bias computed, dp out_valid asserted (dp_valid[0]=1)
+                //      +5 clk → voting register fires, result_valid asserted  ← sample HERE
+                // We already consumed 1 posedge above, so wait 4 more.
+                repeat (PIPE_CYCLES - 1) @(posedge clk);
+                #1; // small delta so registered outputs have settled
+
+                // ── Step 3: Sample and check
                 n_total = n_total + 1;
                 case (expected_class)
                     0: n_healthy_total = n_healthy_total + 1;
@@ -154,10 +169,10 @@ module tb_svm_fault_top;
                     2: n_fault2_total  = n_fault2_total  + 1;
                     3: n_fault3_total  = n_fault3_total  + 1;
                 endcase
-        
-                // Check result
+
                 if (!result_valid) begin
-                    $display("[%0d] ERROR: result_valid not asserted - pipeline timing issue", n_total);
+                    $display("[%0d] ERROR: result_valid not asserted - pipeline timing mismatch",
+                             n_total);
                     n_fail = n_fail + 1;
                 end else if (result_class == expected_class[1:0]) begin
                     n_pass = n_pass + 1;
@@ -169,7 +184,7 @@ module tb_svm_fault_top;
                     endcase
                 end else begin
                     n_fail = n_fail + 1;
-                    $display("[%0d] FAIL: got=%0d exp=%0d  votes: Healthy=%0d F1=%0d F2=%0d F3=%0d",
+                    $display("[%0d] FAIL: got=%0d exp=%0d  votes: H=%0d F1=%0d F2=%0d F3=%0d",
                         n_total,
                         result_class,
                         expected_class,
@@ -178,12 +193,15 @@ module tb_svm_fault_top;
                         result_votes_dbg[8:6],
                         result_votes_dbg[11:9]);
                 end
-        
+
+                // ── Step 4: Extra idle cycle to fully separate pipeline transactions
+                @(posedge clk);
+
             end
-        end  
+        end
         $fclose(fd);
 
-        // ── Final accuracy report (visible in TCL console) ────────────────
+        // ── Final accuracy report ─────────────────────────────────────────
         $display("");
         $display("========================================");
         $display("  BEHAVIORAL SIMULATION COMPLETE");
